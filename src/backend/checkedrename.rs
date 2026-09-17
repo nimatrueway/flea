@@ -7,10 +7,19 @@ const ENOSYS: i32 = 38;
 const EOPNOTSUPP: i32 = 95;
 
 pub(super) fn fallback(from: &Path, to: &Path, error: io::Error) -> io::Result<()> {
+    fallback_with_lookup(from, to, error, |path| path.symlink_metadata())
+}
+
+fn fallback_with_lookup(
+    from: &Path,
+    to: &Path,
+    error: io::Error,
+    lookup: impl FnOnce(&Path) -> io::Result<std::fs::Metadata>,
+) -> io::Result<()> {
     if !matches!(error.raw_os_error(), Some(EINVAL | ENOSYS | EOPNOTSUPP)) {
         return Err(error);
     }
-    match to.symlink_metadata() {
+    match lookup(to) {
         Ok(_) => Err(io::Error::from_raw_os_error(EEXIST)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::rename(from, to),
         Err(error) => Err(error),
@@ -21,7 +30,7 @@ pub(super) fn fallback(from: &Path, to: &Path, error: io::Error) -> io::Result<(
 mod tests {
     use super::*;
     use crate::backend::testdir::TestDir;
-    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{symlink, MetadataExt};
 
     fn retry(from: &Path, to: &Path, errno: i32) -> io::Result<()> {
         fallback(from, to, io::Error::from_raw_os_error(errno))
@@ -93,9 +102,13 @@ mod tests {
         let source = sandbox.file("source", "body");
         let blocked = sandbox.dir("blocked");
         for errno in [EINVAL, ENOSYS, EOPNOTSUPP] {
-            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
-            let result = retry(&source, &blocked.join("target"), errno);
-            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let target = blocked.join("target");
+            let result = fallback_with_lookup(
+                &source, &target, io::Error::from_raw_os_error(errno), |path| {
+                    assert_eq!(path, target);
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                },
+            );
             assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
             assert_eq!(retry(&source, &sandbox.join("missing/target"), errno)
                 .unwrap_err().kind(), io::ErrorKind::NotFound);
